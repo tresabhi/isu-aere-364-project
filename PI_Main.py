@@ -20,7 +20,7 @@ PWM_MAX = 65536
 I_LIMIT = 0.05
 HEIGHT_MAX = 8.0 # In meters
 HOVER_THROTTLE = 0.0
-MIN_FLY_HEIGHT = 0.3
+MIN_FLY_HEIGHT = 0.01
 RC_TIMEOUT = 0.5
 
 """
@@ -101,105 +101,77 @@ while not imu.calibrated:
     time.sleep(1)
 print("IMU calibrated")
 
-
 """ Setting Zeros so that no errors are thrown in the while loop """
 cmd_height = 0.0
 target_height = 0.0
 climb = 0.0
-
-while True:
-    try:
-        e = imu.euler
-    except OSError:
-        e = None
-    if e is not None and None not in e:
-        break
-    time.sleep(0.05)
-target_yaw = math.radians(e[0])
-
-samples = []
-while len(samples) < 20:
-    a = read_alt()
-    if a is not None:
-        samples.append(a)
-    time.sleep(0.05)
-ground = sum(samples) / len(samples)
-
+target_yaw = 0.0
 last_time = time.monotonic()
-last_rc = last_time
 last_print = last_time
 last_alt = 0.0
 last_alt_time = last_time
 
-try:
-    while True:
-        # NOTE: Set sleep point
-        time.sleep(1 / LOOP_RATE)
+while True:
+    # NOTE: Set sleep point
+    time.sleep(1 / LOOP_RATE)
 
-        # NOTE: Grabs newest possible commands. Ensures the range is between desired
-        while len(rotation_command) > 0:
-            try:
-                p = rotation_command.popleft() * 1e-3
-            except IndexError:
-                break
-            if MIN_INPUT <= p <= MAX_INPUT:
-                x = (p - MIN_INPUT) / (MAX_INPUT - MIN_INPUT)
-                cmd_height = HEIGHT_MAX * x
-                last_rc = time.monotonic()
-
-        if time.monotonic() - last_rc > RC_TIMEOUT:
-            cmd_height = 0.0
-
-        # NOTE: Assing values to ueler anfles and gyro
+    # NOTE: Grabs newest possible commands. Ensures the range is between desired
+    while len(rotation_command) > 0:
         try:
-            euler, gyro = imu.euler, imu.gyro
-        except OSError:
-            continue
-        if euler is None or gyro is None or None in euler or None in gyro:
-            continue
-        raw_alt = read_alt()
-        if raw_alt is None:
-            continue
-        alt = raw_alt - ground
+            p = rotation_command.popleft() * 1e-3
+        except IndexError:
+            break
+        if MIN_INPUT <= p <= MAX_INPUT:
+            x = (p - MIN_INPUT) / (MAX_INPUT - MIN_INPUT)
+            cmd_height = HEIGHT_MAX * x
+            last_rc = time.monotonic()
 
-        # NOTE: dt calulation
-        now = time.monotonic()
-        dt = max(now - last_time, 1e-3)
-        last_time = now
+    if time.monotonic() - last_rc > RC_TIMEOUT:
+        cmd_height = 0.0
 
-        if cmd_height < MIN_FLY_HEIGHT:
-            motors_off()
-            for pid in (yaw_pid, roll_pid, pitch_pid, height_pid):
-                pid.reset()
-            target_height = 0.0
-            target_yaw = math.radians(euler[0])
-            climb = 0.0
-            last_alt, last_alt_time = alt, now
-            continue
+    # NOTE: Assing values to ueler anfles and gyro
+    euler, gyro = imu.euler, imu.gyro
+    alt = read_alt()
+    if alt is None:
+        continue
 
-        # NOTE: Error calculations. Normalization to account for wrapping
-        error_yaw = wrap(target_yaw - math.radians(euler[0]))
-        error_roll = wrap(0.0 - math.radians(euler[1]))
-        error_pitch = wrap(0.0 - math.radians(euler[2]))
+    # NOTE: dt calulation
+    now = time.monotonic()
+    dt = max(now - last_time, 1e-3)
+    last_time = now
 
-        yaw_cmd = yaw_pid.update(error_yaw, -gyro[2], dt)
-        roll_cmd = roll_pid.update(error_roll, gyro[0], dt)
-        pitch_cmd = pitch_pid.update(error_pitch, gyro[1], dt)
+    if cmd_height < MIN_FLY_HEIGHT:
+        motors_off()
+        for pid in (yaw_pid, roll_pid, pitch_pid, height_pid):
+            pid.reset()
+        target_height = 0.0
+        target_yaw = math.radians(euler[0])
+        climb = 0.0
+        last_alt, last_alt_time = alt, now
+        continue
+
+    # NOTE: Error calculations. Normalization to account for wrapping
+    error_yaw = wrap(target_yaw - math.radians(euler[0]))
+    error_roll = wrap(0.0 - math.radians(euler[1]))
+    error_pitch = wrap(0.0 - math.radians(euler[2]))
+
+    yaw_cmd = yaw_pid.update(error_yaw, -gyro[2], dt)
+    roll_cmd = roll_pid.update(error_roll, gyro[0], dt)
+    pitch_cmd = pitch_pid.update(error_pitch, gyro[1], dt)
 
 
-        # Throttle limit for now
-        if alt != last_alt:
-            climb = (alt - last_alt) / (now - last_alt_time)
-            last_alt, last_alt_time = alt, now
+    # Throttle limit for now
+    if alt != last_alt:
+        climb = (alt - last_alt) / (now - last_alt_time)
+        last_alt, last_alt_time = alt, now
 
-        step = 0.1 * dt
-        target_height += PID.clamp(cmd_height - target_height, -step, step)
-        error_height = target_height - alt
-        height_cmd = height_pid.update(error_height, climb, dt)
+    step = 0.1 * dt
+    target_height += PID.clamp(cmd_height - target_height, -step, step)
+    error_height = target_height - alt
+    height_cmd = height_pid.update(error_height, climb, dt)
 
-        mix(HOVER_THROTTLE + height_cmd, roll_cmd, pitch_cmd, yaw_cmd)
-        if now - last_print > 0.5:
-            last_print = now
-            print("Alt:", round(alt, 2), "Target:", round(target_height, 2))
-finally:
-    motors_off()
+    mix(HOVER_THROTTLE + height_cmd, roll_cmd, pitch_cmd, yaw_cmd)
+    if now - last_print > 0.1:
+        last_print = now
+        print("Alt:", round(alt, 2), "Target:", round(target_height, 2))
+        print("Controller cmd:", rotation_command)
