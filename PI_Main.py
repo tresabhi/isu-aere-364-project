@@ -1,0 +1,205 @@
+import pulseio
+import board
+import time
+import math
+import adafruit_bno055
+import busio
+import pwmio
+import adafruit_bmp3xx
+
+"""
+Constants are assigned here for usage throughout the whole code not
+global variables though.
+"""
+MOTOR_MIN, MIN_INPUT = 1.0, 1.0 #ms
+MOTOR_MAX, MAX_INPUT = 2.0, 2.0 #ms
+NEUTRAL = 1.0 #ms
+FREQUENCY = 40
+LOOP_RATE = 60 #hz
+PWM_MAX = 65536
+I_LIMIT = 0.05
+HEIGHT_MAX = 8.0 # In meters
+HOVER_THROTTLE = 0.0
+MIN_FLY_HEIGHT = 0.3
+RC_TIMEOUT = 0.5
+
+"""
+Pins are assigned and can be changed SCL, SDA are used for the IMU and
+ultrasonic sensor. Motors use pins 9-12. Order might need to change
+based on how the motors are wired to the pi.
+"""
+def to_duty_cycle(input_ms):
+    return int(input_ms * PWM_MAX * FREQUENCY * 1e-3)
+
+rotation_command = pulseio.PulseIn(board.D5)
+i2c = busio.I2C(board.SCL, board.SDA)
+imu = adafruit_bno055.BNO055_I2C(i2c)
+board.bmp3xx_i2c = True
+altimiter = adafruit_bmp3xx.BMP3XX_I2C(i2c)
+left_motor1 = pwmio.PWMOut(board.D9, frequency=FREQUENCY, duty_cycle=to_duty_cycle(NEUTRAL))
+right_motor1 = pwmio.PWMOut(board.D10, frequency=FREQUENCY, duty_cycle=to_duty_cycle(NEUTRAL))
+left_motor2 = pwmio.PWMOut(board.D11, frequency=FREQUENCY, duty_cycle=to_duty_cycle(NEUTRAL))
+right_motor2 = pwmio.PWMOut(board.D12, frequency=FREQUENCY, duty_cycle=to_duty_cycle(NEUTRAL))
+
+
+# NOTE: PID class is assgined created here. Used for all loops
+class PID:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.i = 0.0
+
+    def reset(self):
+        self.i = 0.0
+
+    @staticmethod
+    def clamp(value, low, high):
+        return max(low, min(high, value))
+
+    def update(self, error, rate, dt):
+        self.i = PID.clamp(self.i + self.ki * error * dt, -I_LIMIT, I_LIMIT)
+        return self.kp * error - self.kd * rate + self.i
+
+# NOTE functions etablisjing control for the motors
+def set_motor(motor, cmd):
+    cmd = PID.clamp(cmd, 0.0, 1.0)
+    motor.duty_cycle = to_duty_cycle(MOTOR_MIN + (MOTOR_MAX - MOTOR_MIN) * cmd)
+
+# Set motors to off state and give rest
+def motors_off():
+    for m in (left_motor1, right_motor1, left_motor2, right_motor2):
+        set_motor(m, 0.0)
+motors_off()
+time.sleep(3)
+
+def mix(throttle, roll, pitch, yaw):
+    set_motor(left_motor1, throttle - roll - pitch - yaw)
+    set_motor(right_motor1, throttle + roll + pitch - yaw)
+    set_motor(left_motor2, throttle - roll + pitch + yaw)
+    set_motor(right_motor2, throttle + roll - pitch + yaw)
+
+# NOTE Angle wrap function for roll, pitch, yaw
+def wrap(error):
+    return ((error + math.pi) % (2 * math.pi) - math.pi) / math.pi
+
+def read_alt():
+    try:
+        return altimiter.altitude
+    except OSError:
+        return None
+
+""" PID Variables are commanded here """
+yaw_pid = PID(0.0, 0.0, 0.0)
+roll_pid = PID(0.0, 0.0, 0.0)
+pitch_pid = PID(0.0, 0.0, 0.0)
+height_pid = PID(0.85, 0.0, 0.80)
+
+""" Requirement for the simulation to read the IMU """
+print("Waiting for IMU to calibrate...")
+while not imu.calibrated:
+    time.sleep(1)
+print("IMU calibrated")
+
+
+""" Setting Zeros so that no errors are thrown in the while loop """
+cmd_height = 0.0
+target_height = 0.0
+climb = 0.0
+
+while True:
+    try:
+        e = imu.euler
+    except OSError:
+        e = None
+    if e is not None and None not in e:
+        break
+    time.sleep(0.05)
+target_yaw = math.radians(e[0])
+
+samples = []
+while len(samples) < 20:
+    a = read_alt()
+    if a is not None:
+        samples.append(a)
+    time.sleep(0.05)
+ground = sum(samples) / len(samples)
+
+last_time = time.monotonic()
+last_rc = last_time
+last_print = last_time
+last_alt = 0.0
+last_alt_time = last_time
+
+try:
+    while True:
+        # NOTE: Set sleep point
+        time.sleep(1 / LOOP_RATE)
+
+        # NOTE: Grabs newest possible commands. Ensures the range is between desired
+        while len(rotation_command) > 0:
+            try:
+                p = rotation_command.popleft() * 1e-3
+            except IndexError:
+                break
+            if MIN_INPUT <= p <= MAX_INPUT:
+                x = (p - MIN_INPUT) / (MAX_INPUT - MIN_INPUT)
+                cmd_height = HEIGHT_MAX * x
+                last_rc = time.monotonic()
+
+        if time.monotonic() - last_rc > RC_TIMEOUT:
+            cmd_height = 0.0
+
+        # NOTE: Assing values to ueler anfles and gyro
+        try:
+            euler, gyro = imu.euler, imu.gyro
+        except OSError:
+            continue
+        if euler is None or gyro is None or None in euler or None in gyro:
+            continue
+        raw_alt = read_alt()
+        if raw_alt is None:
+            continue
+        alt = raw_alt - ground
+
+        # NOTE: dt calulation
+        now = time.monotonic()
+        dt = max(now - last_time, 1e-3)
+        last_time = now
+
+        if cmd_height < MIN_FLY_HEIGHT:
+            motors_off()
+            for pid in (yaw_pid, roll_pid, pitch_pid, height_pid):
+                pid.reset()
+            target_height = 0.0
+            target_yaw = math.radians(euler[0])
+            climb = 0.0
+            last_alt, last_alt_time = alt, now
+            continue
+
+        # NOTE: Error calculations. Normalization to account for wrapping
+        error_yaw = wrap(target_yaw - math.radians(euler[0]))
+        error_roll = wrap(0.0 - math.radians(euler[1]))
+        error_pitch = wrap(0.0 - math.radians(euler[2]))
+
+        yaw_cmd = yaw_pid.update(error_yaw, -gyro[2], dt)
+        roll_cmd = roll_pid.update(error_roll, gyro[0], dt)
+        pitch_cmd = pitch_pid.update(error_pitch, gyro[1], dt)
+
+
+        # Throttle limit for now
+        if alt != last_alt:
+            climb = (alt - last_alt) / (now - last_alt_time)
+            last_alt, last_alt_time = alt, now
+
+        step = 0.1 * dt
+        target_height += PID.clamp(cmd_height - target_height, -step, step)
+        error_height = target_height - alt
+        height_cmd = height_pid.update(error_height, climb, dt)
+
+        mix(HOVER_THROTTLE + height_cmd, roll_cmd, pitch_cmd, yaw_cmd)
+        if now - last_print > 0.5:
+            last_print = now
+            print("Alt:", round(alt, 2), "Target:", round(target_height, 2))
+finally:
+    motors_off()
